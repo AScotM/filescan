@@ -59,16 +59,31 @@ class FileStructureScanner:
         self.max_top_bytes = max_top_bytes
         self.stream_threshold = stream_threshold
         self.follow_symlinks = follow_symlinks
+        self._magic_available = None
+
+    def _check_magic(self) -> bool:
+        if self._magic_available is None:
+            try:
+                import magic
+                self._magic_available = True
+            except ImportError:
+                self._magic_available = False
+        return self._magic_available
 
     def scan(self, path: str) -> FileReport:
+        original_path = path
         target = Path(path)
         
+        resolved_path = target
         if self.follow_symlinks:
-            target = target.resolve()
+            try:
+                resolved_path = target.resolve()
+            except (OSError, RuntimeError):
+                resolved_path = target
 
-        if not target.exists():
+        if not resolved_path.exists():
             return FileReport(
-                path=str(target),
+                path=original_path,
                 exists=False,
                 size=0,
                 sha256=None,
@@ -86,9 +101,30 @@ class FileStructureScanner:
                 notes=["file does not exist"],
             )
 
-        if not target.is_file():
+        is_symlink = target.is_symlink()
+        if is_symlink and not self.follow_symlinks:
             return FileReport(
-                path=str(target),
+                path=original_path,
+                exists=True,
+                size=0,
+                sha256=None,
+                is_binary=None,
+                printable_ratio=None,
+                null_byte_ratio=None,
+                entropy=None,
+                unique_bytes=None,
+                longest_byte_run=None,
+                line_count=None,
+                empty_line_count=None,
+                avg_line_length=None,
+                top_bytes=[],
+                chunk_entropy=[],
+                notes=["symbolic link (not followed)"],
+            )
+
+        if not resolved_path.is_file():
+            return FileReport(
+                path=original_path,
                 exists=True,
                 size=0,
                 sha256=None,
@@ -106,20 +142,20 @@ class FileStructureScanner:
                 notes=["path is not a regular file"],
             )
 
-        size = target.stat().st_size
+        size = resolved_path.stat().st_size
         
         if size > self.stream_threshold:
-            return self._scan_large_file(str(target), size)
+            return self._scan_large_file(original_path, str(resolved_path), size)
         else:
-            return self._scan_small_file(str(target))
+            return self._scan_small_file(original_path, str(resolved_path))
 
-    def _scan_small_file(self, path: str) -> FileReport:
-        target = Path(path)
+    def _scan_small_file(self, original_path: str, resolved_path: str) -> FileReport:
+        target = Path(resolved_path)
         data = target.read_bytes()
         size = len(data)
         notes: List[str] = []
         
-        mime_type = self._detect_mime_type(path)
+        mime_type = self._detect_mime_type(resolved_path)
         sha256 = self._sha256_bytes(data)
         entropy = self._shannon_entropy(data) if data else 0.0
         unique_bytes = len(set(data)) if data else 0
@@ -143,7 +179,7 @@ class FileStructureScanner:
         self._add_notes(notes, size, entropy, null_byte_ratio, is_binary, data)
 
         return FileReport(
-            path=str(target),
+            path=original_path,
             exists=True,
             size=size,
             sha256=sha256,
@@ -162,15 +198,12 @@ class FileStructureScanner:
             mime_type=mime_type,
         )
 
-    def _scan_large_file(self, path: str, size: int) -> FileReport:
+    def _scan_large_file(self, original_path: str, resolved_path: str, size: int) -> FileReport:
         notes: List[str] = []
-        mime_type = self._detect_mime_type(path)
+        mime_type = self._detect_mime_type(resolved_path)
         
         hasher = hashlib.sha256()
-        entropy_sum = 0.0
-        entropy_count = 0
-        unique_bytes_set: set = set()
-        byte_counts = Counter()
+        byte_counts: Counter[int] = Counter()
         null_byte_count = 0
         printable_count = 0
         total_bytes_processed = 0
@@ -179,7 +212,7 @@ class FileStructureScanner:
         previous_byte: Optional[int] = None
         chunk_entropy_list: List[ChunkEntropy] = []
         
-        with open(path, "rb") as f:
+        with open(resolved_path, "rb") as f:
             with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                 for offset in range(0, size, self.chunk_size):
                     chunk = mm[offset:offset + self.chunk_size]
@@ -189,8 +222,6 @@ class FileStructureScanner:
                     hasher.update(chunk)
                     
                     chunk_entropy = self._shannon_entropy(chunk)
-                    entropy_sum += chunk_entropy * chunk_size
-                    entropy_count += chunk_size
                     chunk_entropy_list.append(
                         ChunkEntropy(
                             offset=offset,
@@ -199,7 +230,6 @@ class FileStructureScanner:
                         )
                     )
                     
-                    unique_bytes_set.update(chunk)
                     byte_counts.update(chunk)
                     
                     null_byte_count += chunk.count(0)
@@ -217,12 +247,14 @@ class FileStructureScanner:
                             current_run = 1
                             previous_byte = byte
         
-        total_entropy = entropy_sum / entropy_count if entropy_count > 0 else 0.0
         sha256 = hasher.hexdigest()
-        unique_bytes = len(unique_bytes_set)
+        unique_bytes = len(byte_counts)
         
         printable_ratio = printable_count / total_bytes_processed if total_bytes_processed > 0 else 0.0
         null_byte_ratio = null_byte_count / total_bytes_processed if total_bytes_processed > 0 else 0.0
+        
+        total_entropy = self._shannon_entropy_from_counter(byte_counts, total_bytes_processed)
+        
         is_binary_result = self._guess_binary_from_metrics(printable_ratio, null_byte_ratio) if total_bytes_processed > 0 else False
         
         top_bytes = self._top_bytes_from_counter(byte_counts, total_bytes_processed) if total_bytes_processed > 0 else []
@@ -232,19 +264,19 @@ class FileStructureScanner:
         avg_line_length = None
         
         if not is_binary_result and total_bytes_processed > 0:
-            text_metrics = self._text_metrics_large_file(path)
+            text_metrics = self._text_metrics_large_file(resolved_path)
             if text_metrics:
                 line_count = text_metrics["line_count"]
                 empty_line_count = text_metrics["empty_line_count"]
                 avg_line_length = text_metrics["avg_line_length"]
         
         self._add_notes(notes, size, total_entropy, null_byte_ratio, is_binary_result, None)
-        notes.append("processed using streaming mode")
+        notes.append("processed using memory-mapped chunk scanning")
         
-        longest_run_result = longest_run if longest_run > 0 else None
+        longest_run_result = longest_run if longest_run > 0 else 0
 
         return FileReport(
-            path=str(Path(path).resolve()),
+            path=original_path,
             exists=True,
             size=size,
             sha256=sha256,
@@ -264,11 +296,11 @@ class FileStructureScanner:
         )
 
     def _detect_mime_type(self, path: str) -> Optional[str]:
+        if not self._check_magic():
+            return None
         try:
             import magic
             return magic.from_file(path, mime=True)
-        except ImportError:
-            return None
         except Exception:
             return None
 
@@ -281,12 +313,17 @@ class FileStructureScanner:
 
         counts = Counter(data)
         total = len(data)
-        entropy = 0.0
+        return self._shannon_entropy_from_counter(counts, total)
 
+    def _shannon_entropy_from_counter(self, counts: Counter, total: int) -> float:
+        if total == 0:
+            return 0.0
+        
+        entropy = 0.0
         for count in counts.values():
             probability = count / total
             entropy -= probability * math.log2(probability)
-
+        
         return entropy
 
     def _printable_ratio(self, data: bytes) -> float:
@@ -503,7 +540,7 @@ def format_size(num_bytes: int, binary_units: bool = True) -> str:
     return f"{num_bytes} B"
 
 
-def print_report(report: FileReport, show_chunks: bool = False, verbose: bool = False) -> None:
+def print_report(report: FileReport, show_chunks: bool = False, verbose: bool = False, max_chunks: int = 100) -> None:
     print(f"Path:               {report.path}")
     print(f"Exists:             {report.exists}")
 
@@ -565,7 +602,7 @@ def print_report(report: FileReport, show_chunks: bool = False, verbose: bool = 
             print(f"  Range: {min_entropy:.4f} - {max_entropy:.4f}, Avg: {avg_entropy:.4f}")
             print()
         
-        max_display = 50 if verbose else 20
+        max_display = max_chunks if verbose else min(max_chunks, 20)
         display_chunks = report.chunk_entropy[:max_display]
         
         for chunk in display_chunks:
@@ -613,6 +650,12 @@ def parse_args() -> argparse.Namespace:
         help="Show per-chunk entropy results",
     )
     parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=100,
+        help="Maximum number of chunks to display (default: 100)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Show more detailed output",
@@ -641,7 +684,7 @@ def main() -> int:
             payload = asdict(report)
             print(json.dumps(payload, indent=2))
         else:
-            print_report(report, show_chunks=args.show_chunks, verbose=args.verbose)
+            print_report(report, show_chunks=args.show_chunks, verbose=args.verbose, max_chunks=args.max_chunks)
 
         return 0
     except KeyboardInterrupt:
