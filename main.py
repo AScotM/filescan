@@ -6,14 +6,11 @@ import json
 import math
 import mmap
 import sys
+import os
 from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import logging
-
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -146,7 +143,48 @@ class FileStructureScanner:
                 notes=["path is not a regular file"],
             )
 
-        size = resolved_path.stat().st_size
+        try:
+            size = resolved_path.stat().st_size
+        except OSError as e:
+            return FileReport(
+                path=original_path,
+                exists=True,
+                size=0,
+                sha256=None,
+                is_binary=None,
+                printable_ratio=None,
+                null_byte_ratio=None,
+                entropy=None,
+                unique_bytes=None,
+                longest_byte_run=None,
+                line_count=None,
+                empty_line_count=None,
+                avg_line_length=None,
+                top_bytes=[],
+                chunk_entropy=[],
+                notes=[f"cannot stat file: {e}"],
+            )
+        
+        if size == 0:
+            return FileReport(
+                path=original_path,
+                exists=True,
+                size=0,
+                sha256=hashlib.sha256(b"").hexdigest(),
+                is_binary=False,
+                printable_ratio=1.0,
+                null_byte_ratio=0.0,
+                entropy=0.0,
+                unique_bytes=0,
+                longest_byte_run=0,
+                line_count=0,
+                empty_line_count=0,
+                avg_line_length=0.0,
+                top_bytes=[],
+                chunk_entropy=[],
+                notes=["empty file"],
+                mime_type="application/x-empty",
+            )
         
         if size > self.stream_threshold:
             return self._scan_large_file(original_path, str(resolved_path), size)
@@ -177,26 +215,45 @@ class FileStructureScanner:
                 chunk_entropy=[],
                 notes=["file too large for memory, use streaming mode"],
             )
+        except PermissionError as e:
+            return FileReport(
+                path=original_path,
+                exists=True,
+                size=target.stat().st_size,
+                sha256=None,
+                is_binary=None,
+                printable_ratio=None,
+                null_byte_ratio=None,
+                entropy=None,
+                unique_bytes=None,
+                longest_byte_run=None,
+                line_count=None,
+                empty_line_count=None,
+                avg_line_length=None,
+                top_bytes=[],
+                chunk_entropy=[],
+                notes=[f"permission denied: {e}"],
+            )
         
         size = len(data)
         notes: List[str] = []
         
         mime_type = self._detect_mime_type(resolved_path)
-        sha256 = self._sha256_bytes(data) if data else None
-        entropy = self._shannon_entropy(data) if data else 0.0
-        unique_bytes = len(set(data)) if data else 0
-        printable_ratio = self._printable_ratio(data) if data else 0.0
-        null_byte_ratio = (data.count(0) / size) if size else 0.0
-        is_binary = self._guess_binary(data, printable_ratio, null_byte_ratio) if data else False
-        longest_run = self._longest_byte_run(data) if data else 0
-        top_bytes = self._top_bytes(data) if data else []
-        chunk_entropy = self._chunk_entropy(data) if data else []
+        sha256 = self._sha256_bytes(data)
+        entropy = self._shannon_entropy(data)
+        unique_bytes = len(set(data))
+        printable_ratio = self._printable_ratio(data)
+        null_byte_ratio = data.count(0) / size if size > 0 else 0.0
+        is_binary = self._guess_binary(data, printable_ratio, null_byte_ratio)
+        longest_run = self._longest_byte_run(data)
+        top_bytes = self._top_bytes(data)
+        chunk_entropy = self._chunk_entropy(data)
 
         line_count = None
         empty_line_count = None
         avg_line_length = None
 
-        if not is_binary and size > 0:
+        if not is_binary:
             text_metrics = self._text_metrics(data)
             line_count = text_metrics.get("line_count")
             empty_line_count = text_metrics.get("empty_line_count")
@@ -210,10 +267,10 @@ class FileStructureScanner:
             size=size,
             sha256=sha256,
             is_binary=is_binary,
-            printable_ratio=printable_ratio if size > 0 else None,
-            null_byte_ratio=null_byte_ratio if size > 0 else None,
-            entropy=entropy if size > 0 else None,
-            unique_bytes=unique_bytes if size > 0 else None,
+            printable_ratio=printable_ratio,
+            null_byte_ratio=null_byte_ratio,
+            entropy=entropy,
+            unique_bytes=unique_bytes,
             longest_byte_run=longest_run,
             line_count=line_count,
             empty_line_count=empty_line_count,
@@ -240,41 +297,84 @@ class FileStructureScanner:
         
         try:
             with open(resolved_path, "rb") as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    for offset in range(0, size, self.chunk_size):
-                        chunk = mm[offset:offset + self.chunk_size]
-                        chunk_size = len(chunk)
-                        total_bytes_processed += chunk_size
-                        
-                        hasher.update(chunk)
-                        
-                        chunk_entropy = self._shannon_entropy(chunk)
-                        chunk_entropy_list.append(
-                            ChunkEntropy(
-                                offset=offset,
-                                size=chunk_size,
-                                entropy=chunk_entropy,
+                try:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        for offset in range(0, size, self.chunk_size):
+                            chunk = mm[offset:offset + self.chunk_size]
+                            chunk_size = len(chunk)
+                            total_bytes_processed += chunk_size
+                            
+                            hasher.update(chunk)
+                            
+                            chunk_entropy = self._shannon_entropy(chunk)
+                            chunk_entropy_list.append(
+                                ChunkEntropy(
+                                    offset=offset,
+                                    size=chunk_size,
+                                    entropy=chunk_entropy,
+                                )
                             )
-                        )
-                        
-                        byte_counts.update(chunk)
-                        
-                        null_byte_count += chunk.count(0)
-                        
-                        for byte in chunk:
-                            if byte in (9, 10, 13) or 32 <= byte <= 126:
-                                printable_count += 1
-                        
-                        for byte in chunk:
-                            if byte == previous_byte:
-                                current_run += 1
-                                if current_run > longest_run:
-                                    longest_run = current_run
-                            else:
-                                current_run = 1
-                                previous_byte = byte
-        except MemoryError:
-            notes.append("memory mapping failed, file may be too large")
+                            
+                            byte_counts.update(chunk)
+                            
+                            null_byte_count += chunk.count(0)
+                            
+                            for byte in chunk:
+                                if byte in (9, 10, 13) or 32 <= byte <= 126:
+                                    printable_count += 1
+                            
+                            for byte in chunk:
+                                if byte == previous_byte:
+                                    current_run += 1
+                                    if current_run > longest_run:
+                                        longest_run = current_run
+                                else:
+                                    current_run = 1
+                                    previous_byte = byte
+                except mmap.error as e:
+                    notes.append(f"memory mapping failed: {e}")
+                    return FileReport(
+                        path=original_path,
+                        exists=True,
+                        size=size,
+                        sha256=None,
+                        is_binary=None,
+                        printable_ratio=None,
+                        null_byte_ratio=None,
+                        entropy=None,
+                        unique_bytes=None,
+                        longest_byte_run=None,
+                        line_count=None,
+                        empty_line_count=None,
+                        avg_line_length=None,
+                        top_bytes=[],
+                        chunk_entropy=[],
+                        notes=notes,
+                        mime_type=mime_type,
+                    )
+        except PermissionError as e:
+            notes.append(f"permission denied: {e}")
+            return FileReport(
+                path=original_path,
+                exists=True,
+                size=size,
+                sha256=None,
+                is_binary=None,
+                printable_ratio=None,
+                null_byte_ratio=None,
+                entropy=None,
+                unique_bytes=None,
+                longest_byte_run=None,
+                line_count=None,
+                empty_line_count=None,
+                avg_line_length=None,
+                top_bytes=[],
+                chunk_entropy=[],
+                notes=notes,
+                mime_type=mime_type,
+            )
+        except OSError as e:
+            notes.append(f"IO error: {e}")
             return FileReport(
                 path=original_path,
                 exists=True,
@@ -303,9 +403,9 @@ class FileStructureScanner:
         
         total_entropy = self._shannon_entropy_from_counter(byte_counts, total_bytes_processed)
         
-        is_binary_result = self._guess_binary_from_metrics(printable_ratio, null_byte_ratio) if total_bytes_processed > 0 else False
+        is_binary_result = self._guess_binary_from_metrics(printable_ratio, null_byte_ratio)
         
-        top_bytes = self._top_bytes_from_counter(byte_counts, total_bytes_processed) if total_bytes_processed > 0 else []
+        top_bytes = self._top_bytes_from_counter(byte_counts, total_bytes_processed)
         
         line_count = None
         empty_line_count = None
@@ -329,8 +429,8 @@ class FileStructureScanner:
             size=size,
             sha256=sha256,
             is_binary=is_binary_result,
-            printable_ratio=printable_ratio if total_bytes_processed > 0 else None,
-            null_byte_ratio=null_byte_ratio if total_bytes_processed > 0 else None,
+            printable_ratio=printable_ratio,
+            null_byte_ratio=null_byte_ratio,
             entropy=total_entropy,
             unique_bytes=unique_bytes,
             longest_byte_run=longest_run_result,
@@ -372,11 +472,11 @@ class FileStructureScanner:
             probability = count / total
             entropy -= probability * math.log2(probability)
         
-        return min(entropy, 8.0)
+        return min(max(entropy, 0.0), 8.0)
 
     def _printable_ratio(self, data: bytes) -> float:
         if not data:
-            return 0.0
+            return 1.0
 
         printable = 0
         for byte in data:
@@ -448,7 +548,7 @@ class FileStructureScanner:
                     "hex": f"0x{byte_value:02x}",
                     "char": char_repr,
                     "count": count,
-                    "ratio": count / total,
+                    "ratio": round(count / total, 6),
                 }
             )
         return result
@@ -562,17 +662,25 @@ class FileStructureScanner:
         else:
             notes.append("text-like content")
         
-        if data is not None:
-            if data.startswith(b'\x1f\x8b'):
+        if data is not None and len(data) >= 4:
+            if data[:2] == b'\x1f\x8b':
                 notes.append("gzip compressed content detected")
-            elif data.startswith(b'PK\x03\x04'):
+            elif data[:4] == b'PK\x03\x04':
                 notes.append("ZIP archive detected")
-            elif data.startswith(b'%PDF'):
+            elif data[:4] == b'%PDF':
                 notes.append("PDF document detected")
-            elif data.startswith(b'\x89PNG'):
+            elif data[:8] == b'\x89PNG\r\n\x1a\n':
                 notes.append("PNG image detected")
-            elif data.startswith(b'\xff\xd8\xff'):
+            elif data[:2] == b'\xff\xd8':
                 notes.append("JPEG image detected")
+            elif data[:4] == b'RIFF':
+                notes.append("RIFF container detected")
+            elif data[:4] == b'OggS':
+                notes.append("Ogg container detected")
+            elif data[:5] == b'%!PS':
+                notes.append("PostScript document detected")
+            elif data[:4] == b'\x7fELF':
+                notes.append("ELF executable detected")
 
 
 def format_size(num_bytes: int, binary_units: bool = True) -> str:
@@ -580,10 +688,10 @@ def format_size(num_bytes: int, binary_units: bool = True) -> str:
         return "0 B"
     
     if binary_units:
-        units = ["B", "KiB", "MiB", "GiB", "TiB"]
+        units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
         divisor = 1024.0
     else:
-        units = ["B", "KB", "MB", "GB", "TB"]
+        units = ["B", "KB", "MB", "GB", "TB", "PB"]
         divisor = 1000.0
     
     value = float(num_bytes)
@@ -621,12 +729,12 @@ def print_report(report: FileReport, show_chunks: bool = False, verbose: bool = 
     print(f"Binary guess:       {binary_status}")
     
     if report.entropy is not None:
-        print(f"Entropy:            {report.entropy:.4f}")
+        print(f"Entropy:            {report.entropy:.4f} / 8.0")
     else:
         print(f"Entropy:            N/A")
     
     if report.unique_bytes is not None:
-        print(f"Unique bytes:       {report.unique_bytes}")
+        print(f"Unique bytes:       {report.unique_bytes} / 256")
     else:
         print(f"Unique bytes:       N/A")
     
@@ -650,37 +758,42 @@ def print_report(report: FileReport, show_chunks: bool = False, verbose: bool = 
             print(f"Avg line length:    {report.avg_line_length:.2f}")
 
     if report.notes:
-        print(f"Notes:              {', '.join(report.notes)}")
+        notes_str = ', '.join(report.notes[:5])
+        if len(report.notes) > 5:
+            notes_str += f" and {len(report.notes) - 5} more"
+        print(f"Notes:              {notes_str}")
 
-    if report.top_bytes:
+    if report.top_bytes and (verbose or len(report.top_bytes) > 0):
         print("\nTop bytes:")
-        for item in report.top_bytes:
+        for item in report.top_bytes[:self.max_top_bytes]:
             char_display = f"'{item['char']}'" if len(item['char']) == 1 else item['char']
             print(
                 f"  {item['hex']:>4} ({char_display:>4})  "
                 f"count={item['count']:>8}  "
-                f"ratio={item['ratio']:.4f}"
+                f"ratio={item['ratio']:.6f}"
             )
 
     if show_chunks and report.chunk_entropy:
-        print("\nChunk entropy:")
+        print("\nChunk entropy analysis:")
         
         chunk_stats = [c.entropy for c in report.chunk_entropy]
         if chunk_stats:
             min_entropy = min(chunk_stats)
             max_entropy = max(chunk_stats)
             avg_entropy = sum(chunk_stats) / len(chunk_stats)
-            print(f"  Range: {min_entropy:.4f} - {max_entropy:.4f}, Avg: {avg_entropy:.4f}")
+            print(f"  Range: {min_entropy:.4f} - {max_entropy:.4f}, Average: {avg_entropy:.4f}")
             print()
         
         max_display = max_chunks if verbose else min(max_chunks, 20)
         display_chunks = report.chunk_entropy[:max_display]
         
         for chunk in display_chunks:
+            bar_length = int(chunk.entropy * 4)
+            bar = "█" * bar_length + "░" * (32 - bar_length)
             print(
                 f"  offset={chunk.offset:>10}  "
                 f"size={chunk.size:>6}  "
-                f"entropy={chunk.entropy:.4f}"
+                f"entropy={chunk.entropy:.4f}  {bar}"
             )
         
         if len(report.chunk_entropy) > max_display:
@@ -692,9 +805,16 @@ def parse_args() -> argparse.Namespace:
         description="Scan file entropy and structural characteristics",
         epilog="""
 Examples:
-  %(prog)s file.txt
+  %(prog)s document.pdf
   %(prog)s --json large_file.bin
   %(prog)s --show-chunks --verbose encrypted.dat
+  %(prog)s --chunk-size 8192 --top-bytes 8 binary.bin
+
+Exit codes:
+  0 - Success, file analyzed
+  1 - Error (permission, IO, etc.)
+  2 - File does not exist
+  3 - Analysis incomplete (partial results)
         """
     )
     parser.add_argument("path", help="Path to file")
@@ -752,9 +872,6 @@ Examples:
 
 def main() -> int:
     args = parse_args()
-    
-    if args.verbose:
-        logger.setLevel(logging.INFO)
 
     try:
         scanner = FileStructureScanner(
@@ -768,7 +885,7 @@ def main() -> int:
         if args.json:
             payload = asdict(report)
             print(json.dumps(payload, indent=2))
-        else:
+        elif not args.quiet:
             print_report(
                 report,
                 show_chunks=args.show_chunks,
@@ -778,9 +895,9 @@ def main() -> int:
 
         if not report.exists:
             return 2
-        elif report.is_binary is None:
+        elif report.sha256 is None:
             return 3
-        elif report.notes and any("error" in note.lower() for note in report.notes):
+        elif report.notes and any("error" in note.lower() or "failed" in note.lower() for note in report.notes):
             return 1
         else:
             return 0
